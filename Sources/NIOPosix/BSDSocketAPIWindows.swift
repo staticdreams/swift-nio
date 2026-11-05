@@ -189,6 +189,50 @@ extension Shutdown {
 
 // MARK: _BSDSocketProtocol implementation
 extension NIOBSDSocket {
+    /// Runs a Winsock data-path call and converts its error reporting into an
+    /// `IOResult`, mirroring what `Posix.syscall` does for errno on POSIX
+    /// platforms. A `WSAEWOULDBLOCK` failure becomes `.wouldBlock(0)` and any
+    /// other failure throws an `IOError`.
+    ///
+    /// Unlike the POSIX variant there is no `EINTR` retry loop. `WSAEINTR` only
+    /// arises from the legacy `WSACancelBlockingCall`, which never applies to
+    /// the nonblocking sockets used here.
+    @inline(never)
+    static func winsockSyscall<Value: FixedWidthInteger>(
+        where function: String = #function,
+        _ body: () -> Value
+    ) throws -> IOResult<Value> {
+        let result = body()
+        if result == -1 {  // SOCKET_ERROR
+            let error = WSAGetLastError()
+            if error == WSAEWOULDBLOCK {
+                return .wouldBlock(0)
+            }
+            throw IOError(winsock: error, reason: function)
+        }
+        return .processed(result)
+    }
+
+    /// Variant for Winsock calls that report the transferred count through a
+    /// `DWORD` out-parameter. The wrapper owns that slot, hands it to `body`,
+    /// and reads it only after the call succeeds. A failing call may leave any
+    /// value in the slot, and it is never read.
+    @inline(never)
+    static func winsockSyscall<Value: FixedWidthInteger>(
+        where function: String = #function,
+        _ body: (_ transferred: inout DWORD) -> CInt
+    ) throws -> IOResult<Value> {
+        var transferred: DWORD = 0
+        if body(&transferred) == SOCKET_ERROR {
+            let error = WSAGetLastError()
+            if error == WSAEWOULDBLOCK {
+                return .wouldBlock(0)
+            }
+            throw IOError(winsock: error, reason: function)
+        }
+        return .processed(Value(transferred))
+    }
+
     @inline(never)
     static func accept(
         socket s: NIOBSDSocket.Handle,
@@ -292,15 +336,9 @@ extension NIOBSDSocket {
         buffer buf: UnsafeMutableRawPointer,
         length len: size_t
     ) throws -> IOResult<size_t> {
-        let iResult: CInt = CNIOWindows_recv(s, buf, CInt(len), 0)
-        if iResult == SOCKET_ERROR {
-            let error = WSAGetLastError()
-            if error == WSAEWOULDBLOCK {
-                return .wouldBlock(0)
-            }
-            throw IOError(winsock: error, reason: "recv")
-        }
-        return .processed(size_t(iResult))
+        try winsockSyscall {
+            CNIOWindows_recv(s, buf, CInt(len), 0)
+        }.map(size_t.init)
     }
 
     @inline(never)
@@ -336,16 +374,10 @@ extension NIOBSDSocket {
             )
         }
 
-        var dwNumberOfBytesRecvd: DWORD = 0
         // FIXME(compnerd) is the socket guaranteed to not be overlapped?
-        if WSARecvMsg(s, lpMsg, &dwNumberOfBytesRecvd, nil, nil) == SOCKET_ERROR {
-            let error = WSAGetLastError()
-            if error == WSAEWOULDBLOCK {
-                return .wouldBlock(0)
-            }
-            throw IOError(winsock: error, reason: "recvmsg")
+        return try winsockSyscall { transferred in
+            WSARecvMsg(s, lpMsg, &transferred, nil, nil)
         }
-        return .processed(size_t(dwNumberOfBytesRecvd))
     }
 
     @inline(never)
@@ -357,23 +389,17 @@ extension NIOBSDSocket {
         let WSASendMsg = try Self.lookupWSASendMsg(socket: Handle)
 
         let lpMsg: LPWSAMSG = UnsafeMutablePointer<WSAMSG>(mutating: lpMsg)
-        var NumberOfBytesSent: DWORD = 0
         // FIXME(compnerd) is the socket guaranteed to not be overlapped?
-        if WSASendMsg(
-            Handle,
-            lpMsg,
-            DWORD(dwFlags),
-            &NumberOfBytesSent,
-            nil,
-            nil
-        ) == SOCKET_ERROR {
-            let error = WSAGetLastError()
-            if error == WSAEWOULDBLOCK {
-                return .wouldBlock(0)
-            }
-            throw IOError(winsock: error, reason: "sendmsg")
+        return try winsockSyscall { transferred in
+            WSASendMsg(
+                Handle,
+                lpMsg,
+                DWORD(dwFlags),
+                &transferred,
+                nil,
+                nil
+            )
         }
-        return .processed(size_t(NumberOfBytesSent))
     }
 
     /// Resolves the `WSASendMsg` extension function for the given socket.
@@ -416,15 +442,9 @@ extension NIOBSDSocket {
         buffer buf: UnsafeRawPointer,
         length len: size_t
     ) throws -> IOResult<size_t> {
-        let iResult: CInt = CNIOWindows_send(s, buf, CInt(len), 0)
-        if iResult == SOCKET_ERROR {
-            let error = WSAGetLastError()
-            if error == WSAEWOULDBLOCK {
-                return .wouldBlock(0)
-            }
-            throw IOError(winsock: error, reason: "send")
-        }
-        return .processed(size_t(iResult))
+        try winsockSyscall {
+            CNIOWindows_send(s, buf, CInt(len), 0)
+        }.map(size_t.init)
     }
 
     @inline(never)
@@ -432,17 +452,10 @@ extension NIOBSDSocket {
         socket s: NIOBSDSocket.Handle,
         iovecs: UnsafeBufferPointer<IOVector>
     ) throws -> IOResult<Int> {
-        var bytesSent: DWORD = 0
         let ptr = UnsafeMutablePointer(mutating: iovecs.baseAddress)
-        let result = WSASend(s, ptr, UInt32(iovecs.count), &bytesSent, 0, nil, nil)
-        if result == SOCKET_ERROR {
-            let error = WSAGetLastError()
-            if error == WSAEWOULDBLOCK {
-                return .wouldBlock(0)
-            }
-            throw IOError(winsock: error, reason: "WSASend")
+        return try winsockSyscall { transferred in
+            WSASend(s, ptr, UInt32(iovecs.count), &transferred, 0, nil, nil)
         }
-        return .processed(Int(bytesSent))
     }
 
     @inline(never)
