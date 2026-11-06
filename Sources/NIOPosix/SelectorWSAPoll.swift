@@ -206,6 +206,7 @@ extension Selector: _SelectorBackendProtocol {
             if readSocket == INVALID_SOCKET {
                 throw IOError(winsock: WSAGetLastError(), reason: "accept")
             }
+            NIOBSDSocket.disableInheritance(readSocket)
 
             return (readSocket, writeSocket)
         } catch {

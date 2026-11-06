@@ -24,6 +24,7 @@ import let WinSDK.AF_INET6
 import let WinSDK.AF_UNIX
 
 import let WinSDK.FIONBIO
+import let WinSDK.HANDLE_FLAG_INHERIT
 
 import let WinSDK.INET_ADDRSTRLEN
 import let WinSDK.INET6_ADDRSTRLEN
@@ -85,6 +86,7 @@ import func WinSDK.ioctlsocket
 import func WinSDK.listen
 import func WinSDK.shutdown
 import func WinSDK.socket
+import func WinSDK.SetHandleInformation
 import func WinSDK.GetLastError
 import func WinSDK.ReadFile
 import func WinSDK.TransmitFile
@@ -247,6 +249,7 @@ extension NIOBSDSocket {
             }
             throw IOError(winsock: lastError, reason: "accept")
         }
+        NIOBSDSocket.disableInheritance(socket)
         return socket
     }
 
@@ -494,7 +497,16 @@ extension NIOBSDSocket {
         if socket == WinSDK.INVALID_SOCKET {
             throw IOError(winsock: WSAGetLastError(), reason: "socket")
         }
+        NIOBSDSocket.disableInheritance(socket)
         return socket
+    }
+
+    /// Winsock sockets are inheritable by default, so every process the program starts with handle inheritance
+    /// (`CreateProcessW` with `bInheritHandles`, as Foundation's `Process` does) gets a copy of every socket open at
+    /// that moment. A connection closed here then stays open in the child, and its peer never sees the close. This is
+    /// Windows' counterpart of `SOCK_CLOEXEC` / `FD_CLOEXEC`, which NIO sets on POSIX.
+    static func disableInheritance(_ socket: NIOBSDSocket.Handle) {
+        _ = SetHandleInformation(HANDLE(bitPattern: UInt(socket)), DWORD(HANDLE_FLAG_INHERIT), 0)
     }
 
     @inline(never)
